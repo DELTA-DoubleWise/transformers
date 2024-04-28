@@ -25,6 +25,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...modeling_outputs import (
@@ -48,6 +49,7 @@ from ...utils import (
     logging,
     replace_return_docstrings,
     is_flash_attn_2_available,
+    is_flash_attn_greater_or_equal_2_10
 )
 from .configuration_bert import BertConfig
 
@@ -312,7 +314,6 @@ class BertSelfAttention(nn.Module):
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             query_length, key_length = query_layer.shape[2], key_layer.shape[2]
             if use_cache:
@@ -364,10 +365,13 @@ class BertSelfAttention(nn.Module):
         return outputs
 
 class BertSelfFlashAttention(BertSelfAttention):
-    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(new_x_shape)
-        return x
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
     def forward(
         self,
@@ -381,10 +385,9 @@ class BertSelfFlashAttention(BertSelfAttention):
     ) -> Tuple[torch.Tensor]:
 
         mixed_query_layer = self.query(hidden_states)
-        batch_size, query_length, hidden_size = mixed_query_layer.shape
-
         is_cross_attention = encoder_hidden_states is not None
-
+        bsz, seq_len, hidden_dim = hidden_states.shape
+        
         if is_cross_attention and past_key_value is not None:
             # reuse k,v, cross_attentions
             key_layer = past_key_value[0]
@@ -405,21 +408,80 @@ class BertSelfFlashAttention(BertSelfAttention):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
+        # print(query_layer.shape, key_layer.shape, value_layer.shape)
+
         use_cache = past_key_value is not None
         if self.is_decoder:
             past_key_value = (key_layer, value_layer)
 
-        if attention_mask is None:
-            attention_scores = flash_attn_func(
-                query_layer, key_layer, value_layer, self.dropout.p, softmax_scale=None, causal=self.is_decoder
-            )
+        attn_dropout = self.dropout.p if self.training else 0.0
+
+        query_layer = query_layer.transpose(1, 2)
+        key_layer = key_layer.transpose(1, 2)
+        value_layer = value_layer.transpose(1, 2)
+
+        context_layer = self._flash_attention_forward(
+            query_layer, key_layer, value_layer, attention_mask, seq_len, dropout=attn_dropout
+        )
+
+        context_layer = context_layer.reshape(bsz, seq_len, hidden_dim).contiguous()
+
+        if output_attentions:
+            raise NotImplementedError("output_attentions is not implemented")
+
+        outputs = (context_layer, None)
+        if self.is_decoder:
+            outputs = outputs + (past_key_value,)
+        return outputs
+
+    # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._flash_attention_forward
+    def _flash_attention_forward(
+        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+    ):
+        """
+        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
+        first unpad the input, then computes the attention scores and pad the final attention scores.
+        Args:
+            query_states (`torch.Tensor`):
+                Input query states to be passed to Flash Attention API
+            key_states (`torch.Tensor`):
+                Input key states to be passed to Flash Attention API
+            value_states (`torch.Tensor`):
+                Input value states to be passed to Flash Attention API
+            attention_mask (`torch.Tensor`):
+                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+                position of padding tokens and 1 for the position of non-padding tokens.
+            dropout (`int`, *optional*):
+                Attention dropout
+            softmax_scale (`float`, *optional*):
+                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+        """
+        # Contains at least one padding token in the sequence
+        is_causal = self.is_decoder and attention_mask is None and query_length > 1
+
+        if not self._flash_attn_uses_top_left_mask:
+            causal = is_causal
         else:
+            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
+            causal = is_causal and query_length != 1
+
+        if attention_mask is not None:
+            batch_size = query_states.shape[0]
+
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_layer, key_layer, value_layer, attention_mask, query_length
+                query_states, key_states, value_states, attention_mask, query_length
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            # print("query_states: ", query_states.shape)
+            # print("key_states: ", key_states.shape)
+            # print("value_states: ", value_states.shape)
+            # print("cu_seqlens_q: ", cu_seqlens_q)
+            # print("cu_seqlens_k: ", cu_seqlens_k)
+            # print("max_seqlen_in_batch_q: ", max_seqlen_in_batch_q)
+            # print("max_seqlen_in_batch_k: ", max_seqlen_in_batch_k)
 
             attn_output_unpad = flash_attn_varlen_func(
                 query_states,
@@ -429,24 +491,20 @@ class BertSelfFlashAttention(BertSelfAttention):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_in_batch_q,
                 max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=self.dropout.p,
-                softmax_scale=None,
-                causal=self.is_decoder,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=causal,
             )
 
             attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        else:
+            attn_output = flash_attn_func(
+                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+            )
 
-        attn_output = attn_output.reshape(batch_size, query_length, hidden_size).contiguous()
+        return attn_output
 
-        if output_attentions:
-            raise NotImplementedError("output_attentions is not implemented")
-
-        outputs = (attn_output, None)
-        if self.is_decoder:
-            outputs = outputs + (past_key_value,)
-        return outputs
-
-
+    # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._upad_input
     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
 
@@ -475,6 +533,9 @@ class BertSelfFlashAttention(BertSelfAttention):
         else:
             # The -q_len: slice assumes left padding.
             attention_mask = attention_mask[:, -query_length:]
+            # print("####################################")
+            # print(query_layer.shape, attention_mask.shape)
+            # print("####################################")
             query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
 
         return (
@@ -485,6 +546,7 @@ class BertSelfFlashAttention(BertSelfAttention):
             (cu_seqlens_q, cu_seqlens_k),
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
+
 
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
@@ -499,13 +561,17 @@ class BertSelfOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
+# BERT_ATTENTION_CLASSES = {
+#     "eager": BertSelfAttention,
+#     "flash_attention_2": BertSelfFlashAttention,
+# }
 
 class BertAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
-        super().__init__()
-        if not getattr(config, "_flash_attn_2_enabled", False):
+        super().__init__()        
+        if config._attn_implementation == "eager":
             self.self = BertSelfAttention(config, position_embedding_type=position_embedding_type)
-        else:
+        elif config._attn_implementation == "flash_attention_2":
             if config.position_embedding_type != "absolute":
                 raise NotImplementedError("flash_attn_2 now only supports absolute position embedding")
             self.self = BertSelfFlashAttention(config, position_embedding_type=position_embedding_type)
@@ -1129,7 +1195,7 @@ class BertModel(BertPreTrainedModel):
         )
         encoder_outputs = self.encoder(
             embedding_output,
-            attention_mask=extended_attention_mask if not getattr(self.config, "_flash_attn_2_enabled", False) else attention_mask,
+            attention_mask=extended_attention_mask if not self.config._attn_implementation == "flash_attention_2" else attention_mask,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
