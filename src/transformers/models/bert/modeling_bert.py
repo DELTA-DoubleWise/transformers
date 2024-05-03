@@ -389,6 +389,8 @@ class BertSelfFlashAttention(BertSelfAttention):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
+        if self.position_embedding_type != "absolute":
+            raise NotImplementedError("flash_attn_2 now only supports absolute position embedding")
 
         mixed_query_layer = self.query(hidden_states)
         is_cross_attention = encoder_hidden_states is not None
@@ -661,9 +663,6 @@ BERT_SELF_ATTENTION_CLASSES = {
 class BertAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None):
         super().__init__()
-        if config._attn_implementation == "flash_attention_2" and config.position_embedding_type != "absolute":
-            raise NotImplementedError("flash_attn_2 now only supports absolute position embedding")
-
         self.self = BERT_SELF_ATTENTION_CLASSES[config._attn_implementation](
                 config, position_embedding_type=position_embedding_type
             )
